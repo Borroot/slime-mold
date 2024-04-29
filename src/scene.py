@@ -7,9 +7,10 @@ import collections
 import numpy as np
 
 
-@partial(jax.jit, static_argnames=['config_scene'])
-def scene_init(config_scene, key):
-    height, width, _upscale, initial_population_density = config_scene
+
+def scene_init(config_scene, config_chemo, key):
+    height, width, _, initial_population_density, food_sources, _ = config_scene
+    chemo_deposit, _, _, _ = config_chemo
 
     # generate the positions at which we got agents using the specified density
     key, subkey = jr.split(key, 2)
@@ -25,9 +26,22 @@ def scene_init(config_scene, key):
     ))(mask_grid, subkeys)
 
     trail_grid = jnp.zeros((height, width))  # contains trail data
-    chemo_grid = jnp.zeros((height, width))  # contains chemo-nutrient/food data
 
-    return agent_grid, mask_grid, trail_grid, chemo_grid
+    # contains chemo-nutrient/food data. Food sources are initialized as 3x3
+    # arrays, the extra dimensions here allow food source placement at the very
+    # edges (though the 3x3 size will get clipped). Also need a binary mask of 
+    # the initial chemo grid, to keep food source values constant across iterations.
+    chemo_grid = jnp.zeros((height+2, width+2)) 
+    for food_source in food_sources:
+        chemo_grid = \
+            chemo_grid.at[
+                food_source[0]:food_source[0]+3, 
+                food_source[1]:food_source[1]+3].set(chemo_deposit)
+
+    chemo_grid = chemo_grid[1:-1, 1:-1]
+    food_source_grid = chemo_grid > 0
+
+    return agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid
 
 
 @partial(jax.jit, static_argnames=['height', 'width'])
@@ -128,7 +142,7 @@ def _step(carry_in, coordinate):
         ''' Clears the grid positions at a specific coordinate. Used to
         destroy agents in the field. '''
         # jax.debug.print("Removed agent at position")
-        agent_grid, mask_grid, trail_grid, _ = scene
+        agent_grid, mask_grid, trail_grid, _, _ = scene
         agent_grid = agent_grid.at[*coordinate].set(jnp.zeros(3, dtype=jnp.int32))
         # jax.debug.print("New value at position: {x}", x=agent_grid[*coordinate])
         mask_grid = mask_grid.at[*coordinate].set(False)
@@ -139,10 +153,10 @@ def _step(carry_in, coordinate):
         config_agent, config_trail, config_chemo, key):
         ''' Rotates agent towards the sensor with the highest calculated
         value as per Wu et al. '''
-        agent_grid, mask_grid, trail_grid, chemo_grid = scene
-        sensor_length, reproduction_trigger, elimination_trigger = config_agent
-        trail_deposit, trail_damping, trail_filter_size, trail_weight = config_trail
-        chemo_deposit, chemo_damping, chemo_filter_size, chemo_weight = config_chemo
+        _, _, trail_grid, chemo_grid, _ = scene
+        sensor_length, _, _ = config_agent
+        _, _, _, trail_weight = config_trail
+        _, _, _, chemo_weight = config_chemo
 
         left_sensor, right_sensor = agent_sensor_positions(agent, sensor_length)
         ls_coord = coordinate + left_sensor
@@ -177,11 +191,8 @@ def _step(carry_in, coordinate):
         scene, config_agent, config_trail, config_chemo, to_update, key):
         ''' Moves an agent forward along its velocity vector, by
         one grid position'''
-        agent_grid, mask_grid, trail_grid, chemo_grid = scene
-        sensor_length, reproduction_trigger, elimination_trigger = config_agent
-        trail_deposit, trail_damping, trail_filter_size, trail_weight = config_trail
-        chemo_deposit, chemo_damping, chemo_filter_size, chemo_weight = config_chemo
-
+        agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid = scene
+        trail_deposit, _, _, _ = config_trail
 
         new_pos = coordinate + agent[:2]    
         agent = agent.at[-1].set(agent[-1]+1)
@@ -190,7 +201,7 @@ def _step(carry_in, coordinate):
             agent, coordinate, scene, config_agent, config_trail, config_chemo,
             to_update, key)
 
-        scene = agent_grid, mask_grid, trail_grid, chemo_grid
+        scene = agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid
 
         # rotate agent towards sensor with highest value
         key, subkey = jr.split(key, 2)
@@ -221,9 +232,7 @@ def _step(carry_in, coordinate):
         scene, config_agent, config_trail, config_chemo, to_update, key):
         ''' Randomly selects new velocity for the current agent '''
         # jax.debug.print("Could not move, rotating agent instead")
-        agent_grid, mask_grid, trail_grid, chemo_grid = scene
-        sensor_length, reproduction_trigger, elimination_trigger = config_agent
-        trail_deposit, trail_damping, trail_filter_size, trail_weight = config_trail
+        agent_grid, mask_grid, trail_grid, _, _ = scene
          
         temp_agent = agent_init(key)
         agent = agent.at[:2].set(temp_agent[:2])
@@ -240,8 +249,7 @@ def _step(carry_in, coordinate):
         ''' Attempts to move an agent one square in the direction of 
         their velocity vector. If the square is occupied, randomly
         chooses a new velocity vector and assigns it to the agent.'''
-        agent_grid, mask_grid, trail_grid, _ = scene
-        trail_deposit, trail_damping, trail_filter_size, trail_weight = config_trail
+        agent_grid, mask_grid, trail_grid, _, _ = scene
 
         new_pos = coordinate + agent[:2]
         agent_grid, mask_grid, trail_grid, to_update = jax.lax.cond(
@@ -280,11 +288,8 @@ def _step(carry_in, coordinate):
         # jax.debug.print("Agent coordinate: {x}", x=coordinate)
         # jax.debug.print("Original agent: {x}", x=agent)
 
-        agent_grid, mask_grid, trail_grid, chemo_grid = scene
+        agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid = scene
         sensor_length, reproduction_trigger, elimination_trigger = config_agent
-        trail_deposit, trail_damping, trail_filter_size, trail_weight = config_trail
-        chemo_deposit, chemo_damping, chemo_filter_size, chemo_weight = config_chemo
-
 
         left_sensor, right_sensor = agent_sensor_positions(agent, sensor_length)
         ls_coord = coordinate + left_sensor
@@ -300,7 +305,7 @@ def _step(carry_in, coordinate):
 
         # change agent to its rotated form, and repackage the scene
         agent_grid = agent_grid.at[*coordinate].set(agent)
-        scene = agent_grid, mask_grid, trail_grid, chemo_grid
+        scene = agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid
 
         # if the elimination trigger is met, remove agent. Otherwise, attempt
         # to move forward.
@@ -332,7 +337,7 @@ def _step(carry_in, coordinate):
 
     scene, config_agent, config_trail, config_chemo, to_update, key = carry_in
 
-    agent_grid, mask_grid, trail_grid, chemo_grid = scene
+    agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid = scene
     sensor_length, reproduction_trigger, elimination_trigger = config_agent
     trail_deposit, trail_damping, trail_filter_size, trail_weight = config_trail
     chemo_deposit, chemo_damping, chemo_filter_size, chemo_weight = config_chemo
@@ -353,7 +358,7 @@ def _step(carry_in, coordinate):
         to_update, subkey)   
 
     # package arguments for next iteration
-    scene = agent_grid, mask_grid, trail_grid, chemo_grid
+    scene = agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid
     config_agent = sensor_length, reproduction_trigger, elimination_trigger
     config_trail = trail_deposit, trail_damping, trail_filter_size, trail_weight
     config_chemo = chemo_deposit, chemo_damping, chemo_filter_size, chemo_weight
@@ -367,10 +372,9 @@ def _step(carry_in, coordinate):
 def scene_step(scene, config_trail, config_chemo, config_agent, key):
     """Perform one update step on the scene by updating each agent in a random order."""
 
-    agent_grid, mask_grid, trail_grid, chemo_grid = scene
-    sensor_length, reproduction_trigger, elimination_trigger = config_agent
-    trail_deposit, trail_damping, trail_filter_size, trail_weight = config_trail
-    chemo_deposit, chemo_damping, chemo_filter_size, chemo_weight = config_chemo
+    agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid = scene
+    _, trail_damping, trail_filter_size, _ = config_trail
+    chemo_deposit, chemo_damping, chemo_filter_size, _ = config_chemo
 
     # generate a shuffled list of coordinates which determines the agent update order.
     # coordinates are only updated if an agent is on them. 
@@ -382,70 +386,127 @@ def scene_step(scene, config_trail, config_chemo, config_agent, key):
 
     results, _ = jax.lax.scan(_step, 
         (scene, config_agent, config_trail, config_chemo, to_update, key), coordinates)
-
-    # TODO: convolve both the chemo and trail with an average filter after 
-    # all agents have been updated + rotated. 
-
     scene, _, _, _, _, _ = results
+
+    # convolve both the chemo and trail with an average filter after 
+    # all agents have been updated + rotated. 
+    agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid = scene
+
+    # jax.debug.print('{x}', x=chemo_grid)
+    # chemo grid
+    chemo_kernel = jnp.ones((chemo_filter_size, chemo_filter_size))*\
+        (1/chemo_filter_size**2)
+    chemo_grid = jax.scipy.signal.convolve2d(chemo_grid, chemo_kernel, mode='same')
+
+    chemo_grid = chemo_grid*(1-chemo_damping)
+
+    # reset the values in the food sources to the default
+    not_food_source_grid = food_source_grid == 0
+    chemo_grid = jnp.multiply(not_food_source_grid, chemo_grid) + \
+        food_source_grid*chemo_deposit
+
+    # trail grid
+    trail_kernel = jnp.ones((trail_filter_size, trail_filter_size))*\
+        (1/trail_filter_size**2)
+    trail_grid = jax.scipy.signal.convolve2d(trail_grid, trail_kernel, mode='same')
+    trail_grid = trail_grid*(1-trail_damping)
+
+    scene = agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid
+
 
     return scene
 
 
 # @partial(jax.jit, static_argnames=['upscaled_shape'])
-def scene_pixelmap(scene, upscaled_shape):
+def scene_pixelmap(scene, upscaled_shape, display_config):
     """Create a pixelmap of the scene on the gpu that can be drawn directly."""
-    agent_grid, mask_grid, trail_grid, chemo_grid = scene
+    agent_grid, mask_grid, trail_grid, chemo_grid, food_source_grid = scene
 
-    # TODO add chemo grid to pixelmap
+    display_chemo, display_trail, display_agents, display_food = display_config
 
     # create a black and white colormap based on where there are agents
-    agent_colormap = ((1 - mask_grid) * 255).astype(jnp.uint8)
+    agent_colormap = ((1 - mask_grid) * 255)
     # upscale the black and white colormap
     agent_colormap = jax.image.resize(agent_colormap, upscaled_shape, method='nearest')
 
     # create colormap for trails and food source, blue and red respectively.
-    # every pixel within the trail and chemo grid with a non-zero value will be
-    # overlaid onto the agent colormap, provided an agent isn't in that position. 
-
     # upscale trail and chemo maps
-    trail_colormap = jax.image.resize(trail_grid, upscaled_shape, method='nearest').astype(jnp.uint8)
-    chemo_colormap = jax.image.resize(chemo_grid, upscaled_shape, method='nearest').astype(jnp.uint8)
+    trail_colormap = jax.image.resize(trail_grid, upscaled_shape, method='nearest')
+    chemo_colormap = jax.image.resize(chemo_grid, upscaled_shape, method='nearest')
+    food_source_colormap = \
+        jax.image.resize(
+            food_source_grid, upscaled_shape, method='nearest')
 
     # To achieve the desired color,the target color channel is set to 255, 
     # and the other two are *decreased* in proportion to the value in the 
     # trail/chemo map. This makes low values close to white, and high 
     # values a dark color.
 
-    trail_colormap = jnp.full_like(trail_colormap, 255)-trail_colormap
-    trail_colormap = jnp.maximum(trail_colormap, 1) # Clip to min of 1
-    chemo_colormap = jnp.full_like(chemo_colormap, 255)-chemo_colormap
-    chemo_colormap = jnp.maximum(chemo_colormap, 1) # Clip to min of 1
+    red_channel = jnp.full_like(agent_colormap, 255)
+    green_channel = jnp.full_like(agent_colormap, 255) 
+    blue_channel = jnp.full_like(agent_colormap, 255) 
 
-    # getting rid of pixels where agents are
-    agent_mask = agent_colormap==255
-    trail_colormap = jnp.multiply(trail_colormap, agent_mask)
-    chemo_colormap = jnp.multiply(chemo_colormap, agent_mask)
+    if display_chemo:  
+        # intensity transformation, strictly for visual purposes
+        # clipping the map back to [0, 255]
+        intensity = 30
+        chemo_colormap = jnp.minimum(intensity*chemo_colormap, 255)
+        # inverting the map
+        chemo_colormap = jnp.full_like(chemo_colormap, 255)-chemo_colormap
+        
+        red_channel = jnp.full_like(chemo_colormap, 255)
+        green_channel = chemo_colormap
+        blue_channel = jnp.copy(chemo_colormap)
 
-    # trail
-    trail_pixels = trail_colormap > 0
-    not_trail_pixels = trail_colormap == 0
+    if display_trail:
+        # intensity transformation, strictly for visual purposes
+        # clipping the map back to [0, 255]
+        intensity = 10
+        trail_colormap = jnp.minimum(intensity*trail_colormap, 255)
+        # inverting the map
+        trail_colormap = jnp.full_like(trail_colormap, 255)-trail_colormap
 
-    red_channel = jnp.multiply(agent_colormap, not_trail_pixels) + \
-        jnp.multiply(trail_colormap, trail_pixels)
+        trail_pixels = trail_colormap < 255
+        not_trail_pixels = trail_colormap == 255
+        
+        red_channel = jnp.multiply(red_channel, not_trail_pixels) + \
+            jnp.multiply(trail_colormap, trail_pixels)
 
-    green_channel = jnp.multiply(agent_colormap, not_trail_pixels) + \
-        jnp.multiply(trail_colormap, trail_pixels)
+        green_channel = jnp.multiply(green_channel, not_trail_pixels) + \
+            jnp.multiply(trail_colormap, trail_pixels)
 
-    blue_channel = jnp.multiply(agent_colormap, not_trail_pixels) + \
-        trail_pixels*255
+        blue_channel = jnp.multiply(blue_channel, not_trail_pixels) + \
+            jnp.multiply(jnp.full_like(blue_channel, 255), trail_pixels)
+
+    if display_agents:
+        agent_pixels = agent_colormap == 0
+        not_agent_pixels = agent_colormap == 255
+
+        red_channel = jnp.multiply(red_channel, not_agent_pixels) + \
+            jnp.multiply(agent_colormap, agent_pixels)
+
+        green_channel = jnp.multiply(green_channel, not_agent_pixels) + \
+            jnp.multiply(agent_colormap, agent_pixels)
+
+        blue_channel = jnp.multiply(blue_channel, not_agent_pixels) + \
+            jnp.multiply(agent_colormap, agent_pixels)
+
+    if display_food:
+        # placing food sources on top of everything
+        food_source_pixels = food_source_colormap > 0
+        not_food_source_pixels = food_source_colormap == 0
+
+        red_channel = jnp.multiply(red_channel, not_food_source_pixels) + \
+            jnp.multiply(jnp.full_like(red_channel, 255), food_source_pixels)
+
+        green_channel = jnp.multiply(green_channel, not_food_source_pixels) + \
+            jnp.multiply(jnp.zeros_like(green_channel), food_source_pixels)
+
+        blue_channel = jnp.multiply(blue_channel, not_food_source_pixels) + \
+            jnp.multiply(jnp.zeros_like(blue_channel), food_source_pixels)    
 
 
-    # chemo TODO: debug this, doesn't work as it should. Need to also
-    # figure out a way of combining the colors for trail and chemo
-    # chemo_pixels = jnp.argwhere(chemo_colormap > 0)
-
-    pixelmap = jnp.stack((red_channel, green_channel, blue_channel), axis=-1)
-
+    pixelmap = jnp.stack((red_channel.astype(jnp.uint8), green_channel.astype(jnp.uint8), blue_channel.astype(jnp.uint8)), axis=-1)
 
     # transpose from shape (height, width, 3) to (width, height, 3) for pygame
     transposed_pixelmap = jnp.transpose(pixelmap, (1, 0, 2))
@@ -453,41 +514,6 @@ def scene_pixelmap(scene, upscaled_shape):
     # move the data from the gpu to the cpu so pygame can draw it
     return jax.device_put(transposed_pixelmap, device=jax.devices('cpu')[0])
 
-if __name__ == '__main__':
-
-    sensor_length = 7
-    reproduction_trigger = 15
-    elimination_trigger = -10
-    config_agent = (sensor_length, reproduction_trigger, elimination_trigger)
-
-
-    trail_deposit = 5
-    trail_damping = 0.1
-    trail_filter_size = 3
-    trail_weight = 0.4
-    config_trail = (trail_deposit, trail_damping, trail_filter_size, trail_weight)
-
-    chemo_deposit = 10
-    chemo_damping = 0.2
-    chemo_filter_size = 5
-    chemo_weight = 1 - trail_weight
-    config_chemo = (chemo_deposit, chemo_damping, chemo_filter_size, chemo_weight)  
-
-    height = 10
-    width= 15
-    upscale = 5 
-    initial_population_density = 0.1
-    config_scene = (height, width, upscale, initial_population_density)  
-
-    key = jr.PRNGKey(42)
-
-    agent_grid, mask_grid, trail_grid, chemo_grid = scene_init(config_scene, key)
-
-
-    scene = (agent_grid, mask_grid, trail_grid, chemo_grid)
-
-    agent_grid, mask_grid, trail_grid, chemo_grid = scene_step(
-        scene, config_trail, config_chemo, config_agent, key)
 
 
 
